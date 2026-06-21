@@ -26,6 +26,88 @@ import { Message, ChatSession, Persona } from "./types";
 import { PERSONAS, AVAILABLE_MODELS } from "./data";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
 
+/**
+ * Direct Client-Side Gemini stream caller for static deployments
+ */
+async function callGeminiDirectClientSide(
+  messages: Message[],
+  systemInstruction: string,
+  modelName: string,
+  userApiKey: string,
+  onChunk: (text: string) => void
+) {
+  const contents = messages.map((m) => {
+    const parts: any[] = [];
+    if (m.content) {
+      parts.push({ text: m.content });
+    }
+    if (m.image) {
+      let base64Data = m.image.base64;
+      if (base64Data.includes("base64,")) {
+        base64Data = base64Data.split("base64,")[1];
+      }
+      parts.push({
+        inlineData: {
+          mimeType: m.image.mimeType || "image/jpeg",
+          data: base64Data,
+        },
+      });
+    }
+    return {
+      role: m.role === "assistant" ? "model" : "user",
+      parts: parts.length > 0 ? parts : [{ text: "" }],
+    };
+  });
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse&key=${userApiKey}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents,
+      systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    let parsedErr;
+    try {
+      parsedErr = JSON.parse(errText);
+    } catch (_) {}
+    const msg = parsedErr?.error?.message || errText || response.statusText;
+    throw new Error(msg);
+  }
+
+  const reader = response.body?.getReader();
+  const decoder = new TextDecoder("utf-8");
+  if (reader) {
+    let isDone = false;
+    while (!isDone) {
+      const { value, done } = await reader.read();
+      isDone = done;
+      if (value) {
+        const chunkStr = decoder.decode(value);
+        const lines = chunkStr.split("\n");
+        for (const line of lines) {
+          const cleanLine = line.trim();
+          if (cleanLine.startsWith("data: ")) {
+            const jsonStr = cleanLine.substring(6).trim();
+            try {
+              const parsed = JSON.parse(jsonStr);
+              const textWord = parsed?.candidates?.[0]?.content?.parts?.[0]?.text;
+              if (textWord) {
+                onChunk(textWord);
+              }
+            } catch (_) {}
+          }
+        }
+      }
+    }
+  }
+}
+
 export default function App() {
   // Chat History & Persistence
   const [sessions, setSessions] = useState<ChatSession[]>(() => {
@@ -72,6 +154,16 @@ export default function App() {
   // Advanced settings state
   const [showSettings, setShowSettings] = useState(false);
   const [systemInstructionOverride, setSystemInstructionOverride] = useState("");
+  
+  // Client-side API key for static deploys (e.g., Netlify)
+  const [userApiKey, setUserApiKey] = useState(() => {
+    return localStorage.getItem("nexus_user_gemini_key") || "";
+  });
+
+  // Save changes to localStorage whenever they mutate
+  useEffect(() => {
+    localStorage.setItem("nexus_user_gemini_key", userApiKey);
+  }, [userApiKey]);
   
   // Stats
   const [totalQuestions, setTotalQuestions] = useState(() => {
@@ -321,73 +413,116 @@ export default function App() {
     setSessions([...updatedSessions]);
 
     try {
-      // Pack the conversation payload
-      const payloadMessages = updatedMessages.map((m) => ({
-        role: m.role,
-        content: m.content,
-        image: m.image,
-      }));
-
       const sysInstruction = systemInstructionOverride || currentSession.systemInstruction || activePersona.systemInstruction;
-
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: payloadMessages,
-          systemInstruction: sysInstruction,
-          model: currentSession.model || "gemini-3.5-flash",
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Xatolik yuz berdi: ${response.statusText}`);
-      }
-
-      const reader = response.body?.getReader();
-      const decoder = new TextDecoder("utf-8");
+      const currentModel = currentSession.model || "gemini-3.5-flash";
       let streamText = "";
-      
-      if (reader) {
-        let isDone = false;
-        while (!isDone) {
-          const { value, done } = await reader.read();
-          isDone = done;
-          if (value) {
-            const chunkStr = decoder.decode(value);
-            const lines = chunkStr.split("\n");
-            
-            for (const line of lines) {
-              const cleanLine = line.trim();
-              if (cleanLine.startsWith("data: ")) {
-                const jsonStr = cleanLine.substring(6).trim();
-                if (jsonStr === "[DONE]") {
-                  isDone = true;
-                  break;
+
+      // Check if user has their own custom API key or if they are on Netlify/static site with no server
+      const isNetlify = window.location.hostname.includes("netlify.app") || window.location.hostname.includes("github.io") || (window.location.hostname !== "localhost" && !window.location.hostname.endsWith(".run.app"));
+      const useDirectClientSideCall = (userApiKey && userApiKey.trim().length > 10) || isNetlify;
+
+      if (useDirectClientSideCall) {
+        if (!userApiKey.trim()) {
+          throw new Error("NETLIFY_REQUIRES_API_KEY");
+        }
+        
+        await callGeminiDirectClientSide(
+          updatedMessages,
+          sysInstruction,
+          currentModel,
+          userApiKey.trim(),
+          (chunk) => {
+            streamText += chunk;
+            setSessions((prevSessions) => {
+              return prevSessions.map((s) => {
+                if (s.id === activeSessionId) {
+                  return {
+                    ...s,
+                    messages: s.messages.map((m) =>
+                      m.id === assistantMsgId ? { ...m, content: streamText } : m
+                    ),
+                  };
                 }
-                try {
-                  const parsed = JSON.parse(jsonStr);
-                  if (parsed.text) {
-                    streamText += parsed.text;
-                    // Dynamically update the applet stream state
-                    setSessions((prevSessions) => {
-                      return prevSessions.map((s) => {
-                        if (s.id === activeSessionId) {
-                          return {
-                            ...s,
-                            messages: s.messages.map((m) =>
-                              m.id === assistantMsgId ? { ...m, content: streamText } : m
-                            ),
-                          };
-                        }
-                        return s;
-                      });
-                    });
-                  } else if (parsed.error) {
-                    throw new Error(parsed.error);
+                return s;
+              });
+            });
+          }
+        );
+      } else {
+        // Carry out standard server-side request
+        let response;
+        try {
+          response = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              messages: updatedMessages.map((m) => ({
+                role: m.role,
+                content: m.content,
+                image: m.image,
+              })),
+              systemInstruction: sysInstruction,
+              model: currentModel,
+            }),
+          });
+        } catch (fetchErr) {
+          if (isNetlify || (window.location.hostname !== "localhost" && !window.location.hostname.endsWith(".run.app"))) {
+            throw new Error("SERVER_UNREACHABLE_ON_STATIC_DEPL");
+          }
+          throw fetchErr;
+        }
+
+        const contentType = response.headers.get("content-type") || "";
+        if (!response.ok || contentType.includes("text/html")) {
+          if (contentType.includes("text/html") || response.status === 404) {
+            throw new Error("SERVER_UNREACHABLE_ON_STATIC_DEPL");
+          }
+          throw new Error(`Xatolik yuz berdi: ${response.statusText}`);
+        }
+
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder("utf-8");
+        
+        if (reader) {
+          let isDone = false;
+          while (!isDone) {
+            const { value, done } = await reader.read();
+            isDone = done;
+            if (value) {
+              const chunkStr = decoder.decode(value);
+              const lines = chunkStr.split("\n");
+              
+              for (const line of lines) {
+                const cleanLine = line.trim();
+                if (cleanLine.startsWith("data: ")) {
+                  const jsonStr = cleanLine.substring(6).trim();
+                  if (jsonStr === "[DONE]") {
+                    isDone = true;
+                    break;
                   }
-                } catch (err) {
-                  // silent parse errors representing incomplete JSON chunks
+                  try {
+                    const parsed = JSON.parse(jsonStr);
+                    if (parsed.text) {
+                      streamText += parsed.text;
+                      setSessions((prevSessions) => {
+                        return prevSessions.map((s) => {
+                          if (s.id === activeSessionId) {
+                            return {
+                              ...s,
+                              messages: s.messages.map((m) =>
+                                m.id === assistantMsgId ? { ...m, content: streamText } : m
+                              ),
+                            };
+                          }
+                          return s;
+                        });
+                      });
+                    } else if (parsed.error) {
+                      throw new Error(parsed.error);
+                    }
+                  } catch (err) {
+                    // silent ignore
+                  }
                 }
               }
             }
@@ -426,7 +561,9 @@ export default function App() {
       let errText = `Kechirasiz, javobni olishda uzilish ro'y berdi. Tarmoq ulanishini tekshiring.\n\nFoydali ma'lumot: ${err.message || ""}`;
       
       const errMsg = (err.message || "").toLowerCase();
-      if (
+      if (err.message === "NETLIFY_REQUIRES_API_KEY" || err.message === "SERVER_UNREACHABLE_ON_STATIC_DEPL") {
+        errText = `⚠️ **NEXUSAI: NETLIFY / PORTATIV REJIMDA SOZLANISHI TALAB QILINADI** ⚠️\n\nUshbu platforma hozirda Netlify yoki statik veb-hostingda ishlamoqda. Statik xostlarda Express (orqa fon) serveri bo'lmaganligi sababli, NexusAI-ning ishlashi uchun o'zingizning shaxsiy yoki bepul **Gemini API kaliti (API Key)** talab qilinadi.\n\n### 💡 QANDAY SOZLANADI / TUZATILADI?\n\n1. **API Kalitini Oling (Mutlaqo Bepul):**\n   Google AI Studio orqali o'z shaxsiy kalitingizni bepul yarating: [Google AI Studio Key](https://aistudio.google.com/)\n\n2. **NexusAI-ga kalitni kiriting:**\n   Ekraningizning chap pastki burchagidagi **\"Tizim Sozlamalari\" (Settings)** tugmasini bosing va **\"Shaxsiy Gemini API Key kiritish\"** maydoniga kalitni joylashtirib, **\"O'zgarishlarni saqlash\"** ni bosing.\n\n3. **Muloqotni qayta boshlang!** Ilova ballar barcha ma'lumotlarni bevosita brauzeringizdan xavfsiz jo'natishni boshlaydi.`;
+      } else if (
         errMsg.includes("quota") ||
         errMsg.includes("limit") ||
         errMsg.includes("exceeded") ||
@@ -1144,6 +1281,39 @@ export default function App() {
                 </select>
                 <p className="text-[10px] text-slate-500">
                   Ushbu chat sessiyasi uchun foydalaniladigan model. Agar bittasida bepul so'rov limiti tugasa (Quota Error), boshqasiga o'tkazib sinab ko'ring.
+                </p>
+              </div>
+
+              {/* Custom API Key input block */}
+              <div className="space-y-2 bg-[#151821] p-3 rounded-xl border border-white/5">
+                <label className="text-xs text-slate-400 font-mono uppercase tracking-wider block flex items-center justify-between">
+                  <span>Shaxsiy Gemini API Key (Netlify / Statik rejim uchun)</span>
+                  {userApiKey ? (
+                    <span className="text-[9px] text-emerald-400 uppercase font-bold">Faol (Saqlangan)</span>
+                  ) : (
+                    <span className="text-[9px] text-amber-500 uppercase font-bold">Kiritilmagan</span>
+                  )}
+                </label>
+                <div className="relative">
+                  <input
+                    type="password"
+                    value={userApiKey}
+                    onChange={(e) => setUserApiKey(e.target.value)}
+                    className="w-full bg-[#12141f] border border-white/10 rounded-xl p-2.5 text-xs text-purple-300 font-mono focus:outline-none focus:border-purple-500"
+                    placeholder="AI Studio API kalitini kiriting (masalan: AIzaSy...)"
+                  />
+                  {userApiKey && (
+                    <button
+                      type="button"
+                      onClick={() => setUserApiKey("")}
+                      className="absolute right-2 px-2 py-1 top-1.5 rounded-lg bg-rose-950/40 text-rose-300 hover:bg-rose-950/80 text-[10px] font-mono"
+                    >
+                      Tozalash
+                    </button>
+                  )}
+                </div>
+                <p className="text-[10px] text-slate-500 leading-normal">
+                  Sizning kalitingiz orqa serverga yuborilmaydi va faqat brauzeringiz (localStorage) ichida saqlanadi. Kalit olish: <a href="https://aistudio.google.com/" target="_blank" rel="noopener noreferrer" className="text-purple-400 hover:underline">aistudio.google.com</a>
                 </p>
               </div>
 
