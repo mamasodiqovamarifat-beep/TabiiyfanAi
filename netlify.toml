@@ -1,0 +1,13 @@
+# Netlify Configuration file for NexusAI static deployment
+# Note: Since the app utilizes a secure server.ts for Gemini API token protection,
+# a static build on Netlify will require configuring your GEMINI_API_KEY as an environment variable
+# or utilizing Netlify Serverless Functions if you choose to port the express logic.
+
+[build]
+  publish = "dist"
+  command = "npm run build"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
