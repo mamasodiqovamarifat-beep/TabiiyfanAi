@@ -157,7 +157,7 @@ export default function App() {
   
   // Client-side API key for static deploys (e.g., Netlify)
   const [userApiKey, setUserApiKey] = useState(() => {
-    return localStorage.getItem("nexus_user_gemini_key") || (import.meta as any).env?.VITE_GEMINI_API_KEY || "AIzaSyCJfF1WAfzmx8C-6-sSz6cgmHQakeX37dQ";
+    return localStorage.getItem("nexus_user_gemini_key") || (import.meta as any).env?.VITE_GEMINI_API_KEY || "";
   });
 
   // Save changes to localStorage whenever they mutate
