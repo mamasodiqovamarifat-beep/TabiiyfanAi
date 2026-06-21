@@ -1,0 +1,6 @@
+{
+  "name": "NexusAI",
+  "description": "Keng doiradagi savollarga javob bera oladigan va matn generation qila oladigan aqlli va chiroyli AI yordamchi platformasi (ChatGPT o'xshashi).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
